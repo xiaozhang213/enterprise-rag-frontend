@@ -1,8 +1,8 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { ApiError, ingestDocument, queryKnowledgeBase } from "@/lib/api";
 import MessageBubble, { Message } from "./MessageBubble";
+import { ApiError, ingestDocumentsBatch, queryKnowledgeBaseStream } from "@/lib/api";
 
 export default function ChatWindow() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -12,31 +12,49 @@ export default function ChatWindow() {
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  async function handleSend() {
-    const question = input.trim();
-    if (!question || isLoading) return;
+ async function handleSend() {
+  const question = input.trim();
+  if (!question || isLoading) return;
 
-    setMessages((prev) => [...prev, { role: "user", content: question }]);
-    setInput("");
-    setIsLoading(true);
+  setMessages((prev) => [...prev, { role: "user", content: question }]);
+  setInput("");
+  setIsLoading(true);
 
-    try {
-      const result = await queryKnowledgeBase(question);
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: result.answer, sources: result.sources },
-      ]);
-    } catch (err) {
-      const message =
-        err instanceof ApiError ? err.message : "请求失败，请检查后端服务是否启动";
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: message, isError: true },
-      ]);
-    } finally {
-      setIsLoading(false);
-    }
-  }
+  // 先插入一个空的assistant占位消息，之后靠流式增量填充它
+  setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+
+  await queryKnowledgeBaseStream(question, {
+    onDelta: (text) => {
+      setMessages((prev) => {
+        const updated = [...prev];
+        const last = updated[updated.length - 1];
+        updated[updated.length - 1] = { ...last, content: last.content + text };
+        return updated;
+      });
+    },
+    onSources: (sources) => {
+      setMessages((prev) => {
+        const updated = [...prev];
+        const last = updated[updated.length - 1];
+        updated[updated.length - 1] = { ...last, sources };
+        return updated;
+      });
+    },
+    onError: (message) => {
+      setMessages((prev) => {
+        const updated = [...prev];
+        updated[updated.length - 1] = {
+          role: "assistant",
+          content: message,
+          isError: true,
+        };
+        return updated;
+      });
+    },
+  });
+
+  setIsLoading(false);
+}
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -46,24 +64,29 @@ export default function ChatWindow() {
   }
 
   async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  const files = Array.from(e.target.files ?? []);
+  if (files.length === 0) return;
 
-    setIsUploading(true);
-    setUploadStatus(null);
-    try {
-      const result = await ingestDocument(file);
-      setUploadStatus(
-        `已上传 "${result.filename}"，生成 ${result.chunks_created} 个知识片段`
-      );
-    } catch (err) {
-      const message = err instanceof ApiError ? err.message : "上传失败";
-      setUploadStatus(`上传失败：${message}`);
-    } finally {
-      setIsUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
-    }
+  setIsUploading(true);
+  setUploadStatus(null);
+  try {
+    const result = await ingestDocumentsBatch(files);
+    const failedNames = result.results
+      .filter((r) => r.status === "failed")
+      .map((r) => r.filename);
+
+    setUploadStatus(
+      `成功 ${result.succeeded}/${result.total} 个文件` +
+        (failedNames.length ? `，失败：${failedNames.join(", ")}` : "")
+    );
+  } catch (err) {
+    const message = err instanceof ApiError ? err.message : "上传失败";
+    setUploadStatus(`上传失败：${message}`);
+  } finally {
+    setIsUploading(false);
+    if (fileInputRef.current) fileInputRef.current.value = "";
   }
+}
 
   return (
     <div className="mx-auto flex h-screen max-w-3xl flex-col p-4">
@@ -81,6 +104,7 @@ export default function ChatWindow() {
             ref={fileInputRef}
             type="file"
             accept=".pdf,.docx,.txt"
+            multiple
             className="hidden"
             onChange={handleFileChange}
           />
